@@ -907,6 +907,11 @@ export function parseStudentFile(
 export type CalculateMetricsOptions = {
   /** Limit “Subject comparison” bars to these column labels (e.g. current analysis scope). */
   includeSubjectKey?: (subjectKey: string) => boolean;
+  /**
+   * Show score metrics on 0…`scoreDisplayMax` instead of 0…100.
+   * Student `average` values are still 0–100 internally; they are multiplied by `scoreDisplayMax / 100` here.
+   */
+  scoreDisplayMax?: number;
 };
 
 export function calculateMetrics(
@@ -926,6 +931,10 @@ export function calculateMetrics(
       totalStudents: 0,
     };
   }
+
+  const rawMax = options?.scoreDisplayMax;
+  const scale =
+    rawMax !== undefined && Number.isFinite(rawMax) && rawMax > 0 ? rawMax / 100 : 1;
 
   const averages = students.map((student) => student.average);
   const classAverage = averages.reduce((sum, score) => sum + score, 0) / students.length;
@@ -958,22 +967,22 @@ export function calculateMetrics(
 
   const subjectAverages = Object.entries(subjectTotals).map(([subject, values]) => ({
     subject,
-    average: values.total / values.count,
+    average: Number(((values.total / values.count) * scale).toFixed(2)),
   }));
 
   const scoreTrend = [...students]
     .sort((a, b) => b.average - a.average)
     .map((student, index) => ({
       index: index + 1,
-      score: Number(student.average.toFixed(2)),
+      score: Number((student.average * scale).toFixed(2)),
     }));
 
   return {
-    classAverage: Number(classAverage.toFixed(2)),
+    classAverage: Number((classAverage * scale).toFixed(2)),
     successRate: Number(((passCount / students.length) * 100).toFixed(1)),
     failRate: Number((((students.length - passCount) / students.length) * 100).toFixed(1)),
-    highestScore: Number(Math.max(...averages).toFixed(2)),
-    lowestScore: Number(Math.min(...averages).toFixed(2)),
+    highestScore: Number((Math.max(...averages) * scale).toFixed(2)),
+    lowestScore: Number((Math.min(...averages) * scale).toFixed(2)),
     gradeDistribution,
     subjectAverages,
     scoreTrend,

@@ -105,10 +105,18 @@ export function GradeDashboard() {
   const [gradePieMode, setGradePieMode] = useState<"letter" | "range">("letter");
   const [manualColumnMode, setManualColumnMode] = useState(false);
   const [selectedManualKeys, setSelectedManualKeys] = useState<string[]>([]);
+  /** Maximum points for the course; all score displays are scaled from internal 0–100% to 0…this value. */
+  const [scoreOutOf, setScoreOutOf] = useState("100");
 
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  const scoreScaleMax = useMemo(() => {
+    const n = Number.parseFloat(scoreOutOf.replace(/,/g, "."));
+    if (!Number.isFinite(n) || n <= 0) return 100;
+    return Math.min(n, 1_000_000);
+  }, [scoreOutOf]);
 
   const isExcelFile = (file: File) => {
     const n = file.name.toLowerCase();
@@ -128,6 +136,7 @@ export function GradeDashboard() {
     setSheetPickerFile(null);
     setSheetNames([]);
     setSelectedSheetName("");
+    setScoreOutOf("100");
   };
 
   const subjectKeysUnion = useMemo(
@@ -172,8 +181,8 @@ export function GradeDashboard() {
         : analysisScope === "full"
           ? undefined
           : (k: string) => scopedSubjectKeys.includes(k);
-    return calculateMetrics(displayStudents, { includeSubjectKey });
-  }, [displayStudents, analysisScope, scopedSubjectKeys, manualColumnMode, selectedManualKeys]);
+    return calculateMetrics(displayStudents, { includeSubjectKey, scoreDisplayMax: scoreScaleMax });
+  }, [displayStudents, analysisScope, scopedSubjectKeys, manualColumnMode, selectedManualKeys, scoreScaleMax]);
 
   const letterGradePieData = useMemo(() => {
     const total = metrics.totalStudents || 1;
@@ -190,19 +199,22 @@ export function GradeDashboard() {
   const scoreRangePieData = useMemo(() => {
     const total = displayStudents.length;
     if (!total) return [];
+    const f = scoreScaleMax / 100;
     return SCORE_RANGE_BANDS.map((band, i) => {
       const count = displayStudents.filter(
         (s) => s.average >= band.min && s.average <= band.max
       ).length;
+      const hi = Math.min(band.max * f, scoreScaleMax);
+      const lo = band.min * f;
       return {
-        name: band.label,
+        name: `${lo.toFixed(1)}–${hi.toFixed(1)}`,
         count,
         value: count,
         pct: Number(((count / total) * 100).toFixed(1)),
         fill: RANGE_SLICE_COLORS[i % RANGE_SLICE_COLORS.length],
       };
     }).filter((d) => d.value > 0);
-  }, [displayStudents]);
+  }, [displayStudents, scoreScaleMax]);
 
   const onDrop = async (acceptedFiles: File[]) => {
     const file = acceptedFiles[0];
@@ -314,8 +326,9 @@ export function GradeDashboard() {
       { accessorKey: "name", header: "Student" },
       {
         accessorKey: "average",
-        header: "Average",
-        cell: ({ row }) => `${row.original.average.toFixed(1)}%`,
+        header: `Average (0–${scoreScaleMax})`,
+        cell: ({ row }) =>
+          `${((row.original.average * scoreScaleMax) / 100).toFixed(2)} / ${scoreScaleMax}`,
       },
       {
         accessorKey: "status",
@@ -332,7 +345,7 @@ export function GradeDashboard() {
         cell: ({ row }) => Object.keys(row.original.subjects).length,
       },
     ],
-    []
+    [scoreScaleMax],
   );
 
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -558,11 +571,52 @@ export function GradeDashboard() {
             </Card>
           ) : null}
 
+          {parsedStudents.length > 0 ? (
+            <Card className="border-indigo-500/15 bg-slate-900/40 p-5">
+              <h2 className="text-base font-semibold text-slate-100">Grade scale (maximum points)</h2>
+              <p className="mt-1 text-xs text-slate-400">
+                Internally scores stay as percentages for pass (50%) and letter grades. Enter your course total so
+                averages, charts, and the table show points out of that maximum (e.g. 50 or 60).
+              </p>
+              <div className="mt-3 flex flex-wrap items-end gap-3">
+                <div>
+                  <label htmlFor="score-out-of" className="mb-1 block text-xs font-medium text-slate-400">
+                    Out of
+                  </label>
+                  <Input
+                    id="score-out-of"
+                    type="number"
+                    min={0.01}
+                    step="any"
+                    value={scoreOutOf}
+                    onChange={(e) => setScoreOutOf(e.target.value)}
+                    className="w-32"
+                  />
+                </div>
+                <p className="pb-2 text-xs text-slate-500">
+                  Pass line ≈ {(scoreScaleMax * (PASS_THRESHOLD / 100)).toFixed(2)} pts (50% of max)
+                </p>
+              </div>
+            </Card>
+          ) : null}
+
           <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <StatCard icon={BarChart3} title="Class Average" value={`${metrics.classAverage}%`} />
-            <StatCard icon={CheckCircle2} title="Success Rate" value={`${metrics.successRate}%`} />
-            <StatCard icon={Trophy} title="Highest Score" value={`${metrics.highestScore}%`} />
-            <StatCard icon={XCircle} title="Lowest Score" value={`${metrics.lowestScore}%`} />
+            <StatCard
+              icon={BarChart3}
+              title={`Class average (0–${scoreScaleMax})`}
+              value={`${metrics.classAverage.toFixed(2)} / ${scoreScaleMax}`}
+            />
+            <StatCard icon={CheckCircle2} title="Success rate (students)" value={`${metrics.successRate}%`} />
+            <StatCard
+              icon={Trophy}
+              title={`Highest (0–${scoreScaleMax})`}
+              value={`${metrics.highestScore.toFixed(2)} / ${scoreScaleMax}`}
+            />
+            <StatCard
+              icon={XCircle}
+              title={`Lowest (0–${scoreScaleMax})`}
+              value={`${metrics.lowestScore.toFixed(2)} / ${scoreScaleMax}`}
+            />
           </section>
 
           <section className="flex flex-col gap-4 xl:flex-row">
@@ -581,9 +635,9 @@ export function GradeDashboard() {
                       </linearGradient>
                     </defs>
                     <XAxis dataKey="index" stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                    <YAxis stroke="#94a3b8" domain={[0, 100]} tick={{ fontSize: 11 }} />
+                    <YAxis stroke="#94a3b8" domain={[0, scoreScaleMax]} tick={{ fontSize: 11 }} />
                     <Tooltip
-                      formatter={(v) => [`${v}%`, "Average"]}
+                      formatter={(v) => [`${Number(v).toFixed(2)} / ${scoreScaleMax}`, "Average"]}
                     />
                     <Area type="monotone" dataKey="score" stroke="#818cf8" fill="url(#colorScore)" />
                   </AreaChart>
@@ -595,7 +649,8 @@ export function GradeDashboard() {
               <Card className="flex min-h-[220px] flex-1 flex-col p-4">
                 <p className="mb-1 text-sm font-medium text-slate-200">Pass vs Fail</p>
                 <p className="mb-2 text-[11px] text-slate-500">
-                  Pass vs fail at the 50% threshold for the displayed scope average.
+                  Pass vs fail at 50% of your max ({(scoreScaleMax * (PASS_THRESHOLD / 100)).toFixed(2)} pts) on the
+                  displayed average.
                 </p>
                 {mounted && metrics.totalStudents > 0 ? (
                   <ResponsiveContainer width="100%" height={200}>
@@ -648,7 +703,7 @@ export function GradeDashboard() {
                           : "text-slate-400 hover:text-slate-200"
                       }`}
                     >
-                      % ranges
+                      Point ranges
                     </button>
                   </div>
                 </div>
@@ -754,13 +809,14 @@ export function GradeDashboard() {
           </section>
 
           <Card className="h-80 p-4">
-            <p className="mb-3 text-sm text-slate-300">Subject Comparison</p>
+            <p className="mb-1 text-sm text-slate-300">Subject comparison</p>
+            <p className="mb-3 text-[11px] text-slate-500">Bar height uses the same 0–{scoreScaleMax} scale.</p>
             {mounted ? (
               <ResponsiveContainer width="100%" height="90%">
                 <BarChart data={metrics.subjectAverages}>
                   <XAxis dataKey="subject" stroke="#94a3b8" />
-                  <YAxis stroke="#94a3b8" domain={[0, 100]} />
-                  <Tooltip />
+                  <YAxis stroke="#94a3b8" domain={[0, scoreScaleMax]} />
+                  <Tooltip formatter={(v) => [`${Number(v).toFixed(2)} / ${scoreScaleMax}`, "Average"]} />
                   <Bar dataKey="average" fill="#6366f1" radius={[6, 6, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -859,7 +915,11 @@ export function GradeDashboard() {
 
               <div className="grid grid-cols-2 gap-3">
                 <MiniStat label="Rank" value={String(rankByStudentId.get(selectedStudent.id) ?? "—")} icon={Trophy} />
-                <MiniStat label="Average" value={`${selectedStudent.average.toFixed(1)}%`} icon={FileSpreadsheet} />
+                <MiniStat
+                  label={`Average (0–${scoreScaleMax})`}
+                  value={`${((selectedStudent.average * scoreScaleMax) / 100).toFixed(2)} / ${scoreScaleMax}`}
+                  icon={FileSpreadsheet}
+                />
                 <MiniStat label="Status" value={selectedStudent.status} icon={User2} />
                 <MiniStat
                   label="Sheet ID"
@@ -872,7 +932,9 @@ export function GradeDashboard() {
                 {Object.entries(selectedStudent.subjects).map(([subject, score]) => (
                   <div key={subject} className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2 text-sm">
                     <span className="text-slate-300">{subject}</span>
-                    <span className="font-medium text-indigo-200">{score.toFixed(1)}%</span>
+                    <span className="font-medium text-indigo-200">
+                      {((score * scoreScaleMax) / 100).toFixed(2)} / {scoreScaleMax}
+                    </span>
                   </div>
                 ))}
               </div>
