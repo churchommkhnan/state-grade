@@ -55,6 +55,22 @@ const cellString = (value: unknown): string =>
 
 const nfkc = (s: string) => s.normalize("NFKC");
 
+/** Arabic-Indic / Persian digits → ASCII so Number() parses sheet cells. */
+function normalizeEasternDigitsInString(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 0x0660 && cp <= 0x0669) {
+      out += String(cp - 0x0660);
+    } else if (cp >= 0x06f0 && cp <= 0x06f9) {
+      out += String(cp - 0x06f0);
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 function headerHasStudentName(h: string): boolean {
   const L = nfkc(cellString(h));
   return L.includes(AR_STUDENT_NAME_PRIMARY) || L.includes(AR_STUDENT_NAME_ALT);
@@ -134,10 +150,16 @@ function isIdOrMetaColumn(label: string): boolean {
     "student id",
     "student number",
     "student no",
+    "student code",
     "univ id",
     "university id",
+    "registration",
+    "academic id",
+    "national id",
   ];
-  return markers.some((m) => L.includes(m));
+  if (markers.some((m) => L.includes(m))) return true;
+  if (/\breg\.?\s*no\.?\b/i.test(lower) || /\bstd\.?\s*id\b/i.test(lower)) return true;
+  return false;
 }
 
 /** Header looks like a scored component (not an ID column). */
@@ -195,8 +217,9 @@ function buildEffectiveHeaderLabels(matrix: Matrix, headerRowIndex: number, look
 const numericFrom = (value: unknown, options?: { allowPercent?: boolean }): number | null => {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string") {
-    const raw = value.replace(/\u00a0/g, " ").trim();
+    let raw = value.replace(/\u00a0/g, " ").trim();
     if (raw === "") return null;
+    raw = normalizeEasternDigitsInString(raw);
     if (options?.allowPercent !== false && raw.includes("%")) {
       const withoutPct = raw.replace(/%/g, "").replace(/,/g, ".").trim();
       const n = Number(withoutPct);
@@ -409,7 +432,8 @@ function pickStudentDisplayIdColumn(
   headerRowIndex: number,
   columnLabels: string[],
   width: number,
-  reserved: Set<number>
+  reserved: Set<number>,
+  nameIdx: number
 ): number | null {
   const rowH = matrix[headerRowIndex] ?? [];
   let best: number | null = null;
@@ -419,7 +443,21 @@ function pickStudentDisplayIdColumn(
     if (!columnLooksLikeId(c, matrix, headerRowIndex, columnLabels)) continue;
     const rawH = cellString(rowH[c]);
     const merged = columnLabels[c] ?? "";
-    const label = nfkc(`${merged} ${rawH}`).trim().toLowerCase();
+    const mergedFull = nfkc(`${merged} ${rawH}`);
+    if (headerHasStudentName(rawH) || headerHasStudentName(merged) || headerHasStudentName(mergedFull)) {
+      continue;
+    }
+    if (looksLikeGradeColumnHeader(rawH, merged)) continue;
+
+    let nameLikeData = 0;
+    let dataSamples = 0;
+    for (let r = headerRowIndex + 1; r < matrix.length && dataSamples < 40; r++) {
+      const v = cellString(matrix[r]?.[c]);
+      if (v.length < 2) continue;
+      dataSamples++;
+      if (!/^[\d\s./-]+$/.test(normalizeEasternDigitsInString(v))) nameLikeData++;
+    }
+    const label = mergedFull.trim().toLowerCase();
     let score = 20;
     if (headerIncludes(label, AR_META_SERIAL) || headerIncludes(label, AR_META_ORDER)) score = 5;
     if (/\bstudent\s*(id|no|number)\b/.test(label)) score = 120;
@@ -428,6 +466,8 @@ function pickStudentDisplayIdColumn(
       const m = AR_ID_MARKERS[i];
       if (m && headerIncludes(label, m)) score = Math.max(score, 90 - i);
     }
+    if (c < nameIdx) score += 8;
+    score -= nameLikeData * 3;
     if (score > bestScore || (score === bestScore && best !== null && c < best)) {
       bestScore = score;
       best = c;
@@ -494,20 +534,29 @@ function refinePctIdx(
 
 function pickBestNameColumn(matrix: Matrix, headerRowIndex: number, candidates: number[]): number {
   if (candidates.length === 1) return candidates[0];
-  let best = candidates[0];
-  let bestScore = -1;
+  let best = candidates[0]!;
+  let bestScore = -1e9;
   for (const c of candidates) {
     let score = 0;
+    let samples = 0;
+    let digitLike = 0;
     for (let r = headerRowIndex + 1; r < matrix.length; r++) {
       const v = cellString(matrix[r]?.[c]);
       if (v.length < 2) continue;
-      if (/^\d+$/.test(v)) continue;
-      if (/^[\d\s.-]+$/.test(v)) continue;
+      samples++;
+      if (/^\d+$/.test(normalizeEasternDigitsInString(v))) digitLike++;
+      else if (/^[\d\s./-]+$/.test(normalizeEasternDigitsInString(v))) digitLike += 0.65;
+      if (/^\d+$/.test(normalizeEasternDigitsInString(v))) continue;
+      if (/^[\d\s./-]+$/.test(normalizeEasternDigitsInString(v))) continue;
       if (/[\u0600-\u06FF\u0750-\u077F]/.test(v)) score += 4;
+      else if (/[a-zA-Z]/.test(v)) score += 2;
       else score += 1;
     }
-    if (score > bestScore) {
-      bestScore = score;
+    const noise = samples > 0 ? (digitLike / samples) * 25 : 0;
+    const colBonus = -c * 0.001;
+    const finalScore = score - noise + colBonus;
+    if (finalScore > bestScore) {
+      bestScore = finalScore;
       best = c;
     }
   }
@@ -533,13 +582,26 @@ function buildColumnMap(
     const pick = raw || merged;
     if (!nfkc(pick)) continue;
 
-    if (headerHasStudentName(pick)) nameCandidates.push(c);
+    if (headerHasStudentName(pick)) {
+      if (!columnLooksLikeId(c, matrix, headerRowIndex, columnLabels)) {
+        nameCandidates.push(c);
+      }
+    }
     /** Use deepest row text only for totals/%/status so merged multi-row titles cannot hijack columns. */
     if (totalIdx === null && raw && headerCellIsTotalColumn(raw)) totalIdx = c;
     if (pctIdx === null && raw && headerCellIsPercentageColumn(raw)) pctIdx = c;
     if (statusIdx === null && raw && headerCellIsStatusColumn(raw)) statusIdx = c;
   }
 
+  if (!nameCandidates.length) {
+    for (let c = 0; c < width; c++) {
+      const raw = cellString(rowH[c]);
+      const merged = columnLabels[c] ?? "";
+      const pick = raw || merged;
+      if (!nfkc(pick)) continue;
+      if (headerHasStudentName(pick)) nameCandidates.push(c);
+    }
+  }
   if (!nameCandidates.length) return null;
   const nameIdx = pickBestNameColumn(matrix, headerRowIndex, nameCandidates);
 
@@ -569,7 +631,7 @@ function buildColumnMap(
     return hasMidtermKeyword(rawH) || hasMidtermKeyword(merged);
   });
 
-  const studentIdIdx = pickStudentDisplayIdColumn(matrix, headerRowIndex, columnLabels, width, reserved);
+  const studentIdIdx = pickStudentDisplayIdColumn(matrix, headerRowIndex, columnLabels, width, reserved, nameIdx);
 
   return { nameIdx, studentIdIdx, totalIdx, pctIdx, statusIdx, subjectIdxs, midtermIdxs };
 }
@@ -698,7 +760,26 @@ function parseMatrixWithStructuredHeader(
     if (pctVal !== null && Number.isFinite(pctVal)) {
       average = Math.max(0, Math.min(100, pctVal));
     } else if (totalVal !== null && Number.isFinite(totalVal)) {
-      if (totalVal <= 100) {
+      if (possible > 0) {
+        const tol = Math.max(0.75, possible * 0.04);
+        const totalMatchesRawSum = Math.abs(earned - totalVal) <= tol;
+        if (totalMatchesRawSum || totalVal > 100.5) {
+          average = Math.max(0, Math.min(100, (totalVal / possible) * 100));
+        } else if (totalVal <= 100) {
+          if (
+            componentPercent !== null &&
+            Math.abs(totalVal - componentPercent) <= 12
+          ) {
+            average = Math.max(0, Math.min(100, totalVal));
+          } else if (componentPercent === null) {
+            average = Math.max(0, Math.min(100, totalVal));
+          } else {
+            average = Math.max(0, Math.min(100, (totalVal / possible) * 100));
+          }
+        } else {
+          average = Math.max(0, Math.min(100, (totalVal / possible) * 100));
+        }
+      } else if (totalVal <= 100) {
         average = Math.max(0, Math.min(100, totalVal));
       } else if (componentPercent !== null) {
         average = Math.max(0, Math.min(100, componentPercent));
