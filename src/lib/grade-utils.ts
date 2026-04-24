@@ -209,6 +209,11 @@ const numericFrom = (value: unknown, options?: { allowPercent?: boolean }): numb
   return null;
 };
 
+/** Parse a cell value as a numeric grade (used by PDF/CSV helpers). */
+export function parseCellNumber(value: unknown, options?: { allowPercent?: boolean }): number | null {
+  return numericFrom(value, options);
+}
+
 type Matrix = unknown[][];
 
 function sheetToMatrix(worksheet: XLSX.WorkSheet): Matrix {
@@ -374,6 +379,8 @@ function headerIncludes(h: string, fragment: string): boolean {
 
 type ColumnMap = {
   nameIdx: number;
+  /** Best-effort student / seat / national id column for display (not used in averages). */
+  studentIdIdx: number | null;
   totalIdx: number | null;
   pctIdx: number | null;
   statusIdx: number | null;
@@ -395,6 +402,38 @@ function columnLooksLikeId(
     isIdOrMetaColumn(merged) ||
     isIdOrMetaColumn(`${raw} ${merged}`)
   );
+}
+
+function pickStudentDisplayIdColumn(
+  matrix: Matrix,
+  headerRowIndex: number,
+  columnLabels: string[],
+  width: number,
+  reserved: Set<number>
+): number | null {
+  const rowH = matrix[headerRowIndex] ?? [];
+  let best: number | null = null;
+  let bestScore = -1;
+  for (let c = 0; c < width; c++) {
+    if (reserved.has(c)) continue;
+    if (!columnLooksLikeId(c, matrix, headerRowIndex, columnLabels)) continue;
+    const rawH = cellString(rowH[c]);
+    const merged = columnLabels[c] ?? "";
+    const label = nfkc(`${merged} ${rawH}`).trim().toLowerCase();
+    let score = 20;
+    if (headerIncludes(label, AR_META_SERIAL) || headerIncludes(label, AR_META_ORDER)) score = 5;
+    if (/\bstudent\s*(id|no|number)\b/.test(label)) score = 120;
+    if (/\bseat\b/.test(label)) score = 70;
+    for (let i = 0; i < AR_ID_MARKERS.length - 2; i++) {
+      const m = AR_ID_MARKERS[i];
+      if (m && headerIncludes(label, m)) score = Math.max(score, 90 - i);
+    }
+    if (score > bestScore || (score === bestScore && best !== null && c < best)) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
 }
 
 function headerCellIsPercentageColumn(raw: string): boolean {
@@ -530,7 +569,9 @@ function buildColumnMap(
     return hasMidtermKeyword(rawH) || hasMidtermKeyword(merged);
   });
 
-  return { nameIdx, totalIdx, pctIdx, statusIdx, subjectIdxs, midtermIdxs };
+  const studentIdIdx = pickStudentDisplayIdColumn(matrix, headerRowIndex, columnLabels, width, reserved);
+
+  return { nameIdx, studentIdIdx, totalIdx, pctIdx, statusIdx, subjectIdxs, midtermIdxs };
 }
 
 function rowTextBlob(row: unknown[]): string {
@@ -580,6 +621,9 @@ function parseMatrixWithStructuredHeader(
 
     const name = cellString(row[colMap.nameIdx]);
     if (!name) continue;
+
+    const sheetStudentId =
+      colMap.studentIdIdx !== null ? cellString(row[colMap.studentIdIdx]).trim() : "";
 
     const totalVal =
       colMap.totalIdx !== null ? numericFrom(row[colMap.totalIdx], { allowPercent: true }) : null;
@@ -676,6 +720,7 @@ function parseMatrixWithStructuredHeader(
     outIdx += 1;
     students.push({
       id: `${outIdx}-${name.replace(/\s+/g, "-").slice(0, 80)}`,
+      ...(sheetStudentId ? { sheetStudentId } : {}),
       name,
       average,
       status,
@@ -692,16 +737,42 @@ function parseLegacyFlatRows(rows: Record<string, unknown>[]): StudentRecord[] {
       const entries = Object.entries(row);
       const nameCell = entries.find(([key]) => {
         const normalized = normalizeKey(key);
-        return normalized.includes("name") || normalized.includes("student");
+        return (
+          normalized.includes("name") ||
+          (normalized.includes("student") &&
+            !normalized.includes("id") &&
+            !normalized.includes("number") &&
+            !normalized.includes("no"))
+        );
+      });
+
+      const idCell = entries.find(([key]) => {
+        const normalized = normalizeKey(key);
+        return (
+          normalized === "id" ||
+          normalized.includes("student id") ||
+          normalized.includes("student number") ||
+          normalized.includes("student no") ||
+          normalized.includes("seat") ||
+          normalized.includes("univ")
+        );
       });
 
       const subjects: Record<string, number> = {};
 
       for (const [key, value] of entries) {
         const normalized = normalizeKey(key);
-        if (normalized.includes("name") || normalized.includes("student") || normalized === "id") {
+        if (normalized.includes("name")) continue;
+        if (
+          normalized.includes("student") &&
+          !normalized.includes("id") &&
+          !normalized.includes("number") &&
+          !normalized.includes("no")
+        ) {
           continue;
         }
+        if (idCell && key === idCell[0]) continue;
+        if (normalized === "id") continue;
         const score = numericFrom(value, { allowPercent: true });
         if (score !== null) {
           subjects[key] = Math.max(0, Math.min(100, score));
@@ -719,8 +790,12 @@ function parseLegacyFlatRows(rows: Record<string, unknown>[]): StudentRecord[] {
           ? nameCell[1].trim()
           : `Student ${idx + 1}`;
 
+      const sheetId =
+        idCell && typeof idCell[1] === "string" && idCell[1].trim() ? idCell[1].trim() : undefined;
+
       return {
         id: `${idx + 1}-${name.replace(/\s+/g, "-").toLowerCase()}`,
+        ...(sheetId ? { sheetStudentId: sheetId } : {}),
         name,
         average,
         status: average >= PASS_THRESHOLD ? "Pass" : "Fail",
@@ -765,6 +840,11 @@ export function parseStudentFile(
   file: File,
   options?: ParseStudentFileOptions
 ): Promise<StudentRecord[]> {
+  const lower = file.name.toLowerCase();
+  if (lower.endsWith(".pdf")) {
+    return import("@/lib/pdf-grade-parser").then((m) => m.parseStudentPdf(file));
+  }
+
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 

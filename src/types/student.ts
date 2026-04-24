@@ -1,7 +1,10 @@
 ﻿export type StudentStatus = "Pass" | "Fail";
 
 export interface StudentRecord {
+  /** Stable row id for React / sorting (not necessarily the sheet student number). */
   id: string;
+  /** Student number / seat / national id from the sheet when detected (shown next to name). */
+  sheetStudentId?: string;
   name: string;
   average: number;
   status: StudentStatus;

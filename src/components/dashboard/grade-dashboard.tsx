@@ -45,9 +45,10 @@ import {
   getAvailableAnalysisScopes,
   type AnalysisScope,
   subjectKeysForScope,
+  weightedAverageFromSubjectEntries,
 } from "@/lib/analysis-scope";
-import { calculateMetrics, parseStudentFile, readWorkbookSheetNames } from "@/lib/grade-utils";
-import { DashboardMetrics, StudentRecord } from "@/types/student";
+import { calculateMetrics, parseStudentFile, PASS_THRESHOLD, readWorkbookSheetNames } from "@/lib/grade-utils";
+import { DashboardMetrics, StudentRecord, StudentStatus } from "@/types/student";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -76,6 +77,8 @@ const SCORE_RANGE_BANDS: { label: string; min: number; max: number }[] = [
 
 const RANGE_SLICE_COLORS = ["#22c55e", "#84cc16", "#eab308", "#f97316", "#f43f5e", "#991b1b"];
 
+type TableStudentRow = StudentRecord & { classRank: number };
+
 const metricSeed: DashboardMetrics = {
   classAverage: 0,
   successRate: 0,
@@ -100,6 +103,8 @@ export function GradeDashboard() {
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [selectedSheetName, setSelectedSheetName] = useState<string>("");
   const [gradePieMode, setGradePieMode] = useState<"letter" | "range">("letter");
+  const [manualColumnMode, setManualColumnMode] = useState(false);
+  const [selectedManualKeys, setSelectedManualKeys] = useState<string[]>([]);
 
   useEffect(() => {
     setMounted(true);
@@ -110,10 +115,14 @@ export function GradeDashboard() {
     return n.endsWith(".xlsx") || n.endsWith(".xls");
   };
 
+  const isPdfFile = (file: File) => file.name.toLowerCase().endsWith(".pdf");
+
   const runParse = async (file: File, sheetName?: string) => {
     const parsed = await parseStudentFile(file, sheetName ? { sheetName } : undefined);
     setParsedStudents(parsed);
     const keys = collectAllSubjectKeys(parsed);
+    setSelectedManualKeys(keys);
+    setManualColumnMode(false);
     const avail = getAvailableAnalysisScopes(keys);
     setAnalysisScope(avail.includes("full") ? "full" : avail[0] ?? "full");
     setSheetPickerFile(null);
@@ -143,19 +152,28 @@ export function GradeDashboard() {
     [analysisScope, subjectKeysUnion]
   );
 
-  const displayStudents = useMemo(
-    () => applyAnalysisScope(parsedStudents, analysisScope),
-    [parsedStudents, analysisScope]
-  );
+  const displayStudents = useMemo(() => {
+    if (!parsedStudents.length) return [];
+    if (manualColumnMode && selectedManualKeys.length > 0) {
+      return parsedStudents.map((s) => {
+        const average = weightedAverageFromSubjectEntries(s.subjects, selectedManualKeys);
+        const status: StudentStatus = average >= PASS_THRESHOLD ? "Pass" : "Fail";
+        return { ...s, average, status };
+      });
+    }
+    return applyAnalysisScope(parsedStudents, analysisScope);
+  }, [parsedStudents, analysisScope, manualColumnMode, selectedManualKeys]);
 
   const metrics = useMemo((): DashboardMetrics => {
     if (!displayStudents.length) return metricSeed;
     const includeSubjectKey =
-      analysisScope === "full"
-        ? undefined
-        : (k: string) => scopedSubjectKeys.includes(k);
+      manualColumnMode && selectedManualKeys.length > 0
+        ? (k: string) => selectedManualKeys.includes(k)
+        : analysisScope === "full"
+          ? undefined
+          : (k: string) => scopedSubjectKeys.includes(k);
     return calculateMetrics(displayStudents, { includeSubjectKey });
-  }, [displayStudents, analysisScope, scopedSubjectKeys]);
+  }, [displayStudents, analysisScope, scopedSubjectKeys, manualColumnMode, selectedManualKeys]);
 
   const letterGradePieData = useMemo(() => {
     const total = metrics.totalStudents || 1;
@@ -196,6 +214,11 @@ export function GradeDashboard() {
       setSheetNames([]);
       setSelectedSheetName("");
 
+      if (isPdfFile(file)) {
+        await runParse(file);
+        return;
+      }
+
       if (isExcelFile(file)) {
         const names = await readWorkbookSheetNames(file);
         if (names.length > 1) {
@@ -209,8 +232,12 @@ export function GradeDashboard() {
       }
 
       await runParse(file);
-    } catch {
-      setUploadError("Could not parse this file. Use CSV/XLSX with names and subject scores.");
+    } catch (err) {
+      setUploadError(
+        err instanceof Error
+          ? err.message
+          : "Could not parse this file. Use CSV, XLSX, XLS, or a text-based PDF with clear columns."
+      );
     }
   };
 
@@ -219,8 +246,12 @@ export function GradeDashboard() {
     try {
       setUploadError(null);
       await runParse(sheetPickerFile, selectedSheetName);
-    } catch {
-      setUploadError("Could not parse this file. Use CSV/XLSX with names and subject scores.");
+    } catch (err) {
+      setUploadError(
+        err instanceof Error
+          ? err.message
+          : "Could not parse this file. Use CSV, XLSX, XLS, or a text-based PDF with clear columns."
+      );
     }
   };
 
@@ -231,19 +262,55 @@ export function GradeDashboard() {
       "text/csv": [".csv"],
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
       "application/vnd.ms-excel": [".xls"],
+      "application/pdf": [".pdf"],
     },
   });
 
-  const filteredStudents = useMemo(() => {
-    return displayStudents.filter((student) => {
-      const matchQuery = student.name.toLowerCase().includes(query.toLowerCase());
-      const matchStatus = statusFilter === "all" ? true : student.status === statusFilter;
-      return matchQuery && matchStatus;
+  const rankByStudentId = useMemo(() => {
+    const sorted = [...displayStudents].sort((a, b) => {
+      if (b.average !== a.average) return b.average - a.average;
+      return a.name.localeCompare(b.name);
     });
-  }, [displayStudents, query, statusFilter]);
+    const map = new Map<string, number>();
+    for (let i = 0; i < sorted.length; i++) {
+      const prev = sorted[i - 1];
+      const cur = sorted[i];
+      if (!cur) continue;
+      const r =
+        i > 0 && prev && cur.average === prev.average ? (map.get(prev.id) ?? i + 1) : i + 1;
+      map.set(cur.id, r);
+    }
+    return map;
+  }, [displayStudents]);
 
-  const columns = useMemo<ColumnDef<StudentRecord>[]>(
+  const tableRows = useMemo((): TableStudentRow[] => {
+    return displayStudents
+      .filter((student) => {
+        const matchQuery = student.name.toLowerCase().includes(query.toLowerCase());
+        const matchId = (student.sheetStudentId ?? "")
+          .toLowerCase()
+          .includes(query.toLowerCase());
+        const matchQ = matchQuery || matchId;
+        const matchStatus = statusFilter === "all" ? true : student.status === statusFilter;
+        return matchQ && matchStatus;
+      })
+      .map((s) => ({ ...s, classRank: rankByStudentId.get(s.id) ?? 0 }));
+  }, [displayStudents, query, statusFilter, rankByStudentId]);
+
+  const columns = useMemo<ColumnDef<TableStudentRow>[]>(
     () => [
+      {
+        id: "rank",
+        header: "Rank",
+        cell: ({ row }) => <span className="tabular-nums text-slate-200">{row.original.classRank}</span>,
+      },
+      {
+        id: "sheetId",
+        header: "ID",
+        cell: ({ row }) => (
+          <span className="text-slate-300">{row.original.sheetStudentId?.trim() || "—"}</span>
+        ),
+      },
       { accessorKey: "name", header: "Student" },
       {
         accessorKey: "average",
@@ -270,7 +337,7 @@ export function GradeDashboard() {
 
   // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({
-    data: filteredStudents,
+    data: tableRows,
     columns,
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
@@ -319,8 +386,10 @@ export function GradeDashboard() {
             >
               <input {...getInputProps()} />
               <UploadCloud className="mx-auto mb-3 size-8 text-indigo-300" />
-              <p className="font-medium">Drag & drop your Excel/CSV file</p>
-              <p className="mt-1 text-sm text-slate-400">or click to browse</p>
+              <p className="font-medium">Drag & drop Excel, CSV, or PDF</p>
+              <p className="mt-1 text-sm text-slate-400">
+                PDF must be text-based with columns separated by tabs or multiple spaces.
+              </p>
             </div>
             {uploadError ? <p className="mt-3 text-sm text-rose-300">{uploadError}</p> : null}
 
@@ -415,6 +484,77 @@ export function GradeDashboard() {
                 </div>
               ) : null}
               <p className="mt-3 text-[11px] text-slate-500">{ANALYSIS_SCOPE_LABELS[analysisScope].description}</p>
+            </Card>
+          ) : null}
+
+          {parsedStudents.length > 0 && subjectKeysUnion.length > 0 ? (
+            <Card className="border-white/10 bg-slate-900/40 p-5">
+              <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-slate-100">Columns for class average</h2>
+                  <p className="text-xs text-slate-400">
+                    Turn on custom selection to choose exactly which score columns drive the average, charts, pass/fail,
+                    and rank. When off, the analysis scope above is used.
+                  </p>
+                </div>
+                <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={manualColumnMode}
+                    onChange={(e) => {
+                      setManualColumnMode(e.target.checked);
+                      if (e.target.checked && selectedManualKeys.length === 0) {
+                        setSelectedManualKeys([...subjectKeysUnion]);
+                      }
+                    }}
+                    className="size-4 rounded border-white/20 bg-slate-900"
+                  />
+                  Custom columns
+                </label>
+              </div>
+              {manualColumnMode ? (
+                <>
+                  <div className="mb-2 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setSelectedManualKeys([...subjectKeysUnion])}
+                    >
+                      Select all
+                    </Button>
+                    <Button type="button" size="sm" variant="outline" onClick={() => setSelectedManualKeys([])}>
+                      Clear
+                    </Button>
+                  </div>
+                  <div className="max-h-48 space-y-2 overflow-y-auto rounded-lg border border-white/10 bg-slate-950/50 p-3">
+                    {subjectKeysUnion.map((key) => {
+                      const checked = selectedManualKeys.includes(key);
+                      return (
+                        <label
+                          key={key}
+                          className="flex cursor-pointer items-start gap-2 text-sm text-slate-200"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              setSelectedManualKeys((prev) =>
+                                prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+                              );
+                            }}
+                            className="mt-0.5 size-4 shrink-0 rounded border-white/20 bg-slate-900"
+                          />
+                          <span className="break-all">{key}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {selectedManualKeys.length === 0 ? (
+                    <p className="mt-2 text-xs text-amber-200/90">Select at least one column, or turn off custom mode.</p>
+                  ) : null}
+                </>
+              ) : null}
             </Card>
           ) : null}
 
@@ -631,7 +771,12 @@ export function GradeDashboard() {
             <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center">
               <div className="relative w-full md:max-w-sm">
                 <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
-                <Input value={query} onChange={(e) => setQuery(e.target.value)} className="pl-9" placeholder="Search student..." />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  className="pl-9"
+                  placeholder="Search by name or ID..."
+                />
               </div>
               <div className="flex gap-2">
                 <Filter className="mt-2 size-4 text-slate-400" />
@@ -702,6 +847,10 @@ export function GradeDashboard() {
                 <div>
                   <p className="text-xs text-slate-400">Student Insight</p>
                   <h3 className="text-xl font-semibold">{selectedStudent.name}</h3>
+                  <p className="mt-1 text-xs text-slate-500">
+                    ID: {selectedStudent.sheetStudentId?.trim() || "—"} · Rank:{" "}
+                    {rankByStudentId.get(selectedStudent.id) ?? "—"} (by current average)
+                  </p>
                 </div>
                 <Button variant="ghost" size="sm" onClick={() => setSelectedStudent(null)}>
                   Close
@@ -709,8 +858,14 @@ export function GradeDashboard() {
               </div>
 
               <div className="grid grid-cols-2 gap-3">
+                <MiniStat label="Rank" value={String(rankByStudentId.get(selectedStudent.id) ?? "—")} icon={Trophy} />
                 <MiniStat label="Average" value={`${selectedStudent.average.toFixed(1)}%`} icon={FileSpreadsheet} />
                 <MiniStat label="Status" value={selectedStudent.status} icon={User2} />
+                <MiniStat
+                  label="Sheet ID"
+                  value={selectedStudent.sheetStudentId?.trim() || "—"}
+                  icon={FileSpreadsheet}
+                />
               </div>
 
               <div className="mt-4 space-y-2">
